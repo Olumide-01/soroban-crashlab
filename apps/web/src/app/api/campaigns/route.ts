@@ -1,8 +1,10 @@
+import { withRouteErrorHandling, readJsonBody } from '@/lib/route-handler';
 import { randomUUID } from 'node:crypto';
 import { NextRequest, NextResponse } from 'next/server';
-import { readJsonBody, withRouteErrorHandling } from '@/lib/route-handler';
+import { withCsrfGuard } from '@/lib/csrf';
 import { createdResponse, successResponse } from '@/lib/api-response-utils';
 import { codedErrorResponse, ERROR_CODES } from '@/lib/error-codes';
+import { withIdempotency } from '@/lib/idempotency-middleware';
 import {
   IDEMPOTENCY_KEY_HEADER,
   IDEMPOTENT_REPLAYED_HEADER,
@@ -25,6 +27,7 @@ import {
 import { readQuotaLimits } from '@/lib/capacity/quotas';
 import { getCapacityLedger } from '@/lib/capacity/usage-ledger';
 import { readSchedulingWindows } from '@/lib/capacity/windows';
+import { registerCampaign } from '@/lib/campaigns/campaign-registry';
 import { resolvePrincipal, resolveRoleForPrincipal } from '@/lib/rbac';
 
 const IDEMPOTENCY_SCOPE = 'POST /api/campaigns';
@@ -49,6 +52,7 @@ interface CampaignResponse {
  *  - first request with a key       → 201, campaign created, result stored 24h
  *  - same key, same payload         → 200, the original campaign replayed
  *                                     (`Idempotent-Replayed: true`)
+ *  - same key, request in flight    → 409 IDEMPOTENCY_IN_FLIGHT (+ Retry-After)
  *  - same key, different payload    → 422 IDEMPOTENCY_KEY_REUSED
  *  - malformed key                  → 400 IDEMPOTENCY_KEY_INVALID
  * Requests without the header behave as before (201, always a new campaign).
@@ -61,16 +65,28 @@ interface CampaignResponse {
  *    bypass is written to the audit log. Non-maintainers → 403 QUOTA_OVERRIDE_FORBIDDEN.
  * With no quotas or windows configured every campaign is admitted, as before.
  */
-export const POST = withRouteErrorHandling('POST /api/campaigns', async (request: NextRequest) => {
+export const POST = withCsrfGuard(
+  'POST /api/campaigns',
+  withRouteErrorHandling('POST /api/campaigns', async (request: NextRequest) => {
+    return withIdempotency(request, IDEMPOTENCY_SCOPE, async (ctx) => {
+      return createCampaign(request, ctx);
+    });
+  }),
+);
+
+async function createCampaign(
+  request: NextRequest,
+  ctx: { key: string | null; store: ReturnType<typeof selectIdempotencyStore> | null },
+) {
   const parsedKey = parseIdempotencyKey(request.headers.get(IDEMPOTENCY_KEY_HEADER));
   if (!parsedKey.ok) return codedErrorResponse('IDEMPOTENCY_KEY_INVALID', parsedKey.error);
 
   const parsedBody = await readJsonBody(request);
   if ('error' in parsedBody) return parsedBody.error;
-  const payload = parsedBody.body as Record<string, unknown>;
+  const payload = (parsedBody.body ?? {}) as Record<string, unknown>;
 
-  const key = parsedKey.key;
-  const store = key ? selectIdempotencyStore() : null;
+  const key = ctx.key;
+  const store = ctx.store;
 
   if (key && store) {
     const existing = await store.get<CampaignResponse>(IDEMPOTENCY_SCOPE, key);
@@ -140,6 +156,25 @@ export const POST = withRouteErrorHandling('POST /api/campaigns', async (request
   }
 
   ledger.admit({ campaignId: campaign.id, ...resources });
+
+  // The timeline (#1874) is keyed by campaign id; register the new campaign
+  // (and its start marker) so `GET /api/campaigns/[id]/timeline` can serve it.
+  registerCampaign({
+    id: campaign.id,
+    name:
+      typeof payload.name === 'string' && payload.name.trim().length > 0
+        ? payload.name.trim()
+        : undefined,
+    status: 'queued',
+    createdAt: campaign.createdAt,
+    target: {
+      ...(typeof payload.area === 'string' ? { area: payload.area } : {}),
+      ...(typeof payload.preset === 'string' ? { preset: payload.preset } : {}),
+      seeds: resources.seeds,
+      workers: resources.workers,
+    },
+  });
+
   if (overriddenBy !== null && !admission.ok) {
     recordAuditEvent({
       action: 'quota.override',
@@ -161,7 +196,7 @@ export const POST = withRouteErrorHandling('POST /api/campaigns', async (request
     created.headers.set(IDEMPOTENT_REPLAYED_HEADER, 'false');
   }
   return created;
-});
+}
 
 function admissionRejected(admission: Exclude<CampaignAdmission, { ok: true }>): NextResponse {
   if (admission.kind === 'window') {
@@ -190,7 +225,7 @@ function replayOrReject(
   storedResponse: CampaignResponse,
   payload: unknown,
   key: string,
-) {
+) : NextResponse {
   if (storedFingerprint !== fingerprintPayload(payload)) {
     return codedErrorResponse('IDEMPOTENCY_KEY_REUSED');
   }
@@ -199,3 +234,5 @@ function replayOrReject(
   replay.headers.set(IDEMPOTENT_REPLAYED_HEADER, 'true');
   return replay;
 }
+
+export { createCampaign };

@@ -11,19 +11,22 @@
 //! See `docs/RUN_LIFECYCLE.md` for the start → checkpoint → resume → cancel
 //! lifecycle and ADR-0008 for the design rationale.
 
-use crashlab_core::{
-    CaseSeed, HealthMonitor, MutationBudget, QuotaGuard, RunId, RunTerminalState, ThrottleDecision,
-    RUN_CHECKPOINT_SCHEMA_VERSION, CampaignPreset, CancelSignal, SeededPrng, WorkerPartition,
-    cancel_marker_path, cancel_requested, create_runner, default_state_dir, drive_run,
-    drive_run_from_checkpoint, drive_run_partitioned_from_checkpoint, load_run_checkpoint_json,
-    read_latest_health_snapshot, read_latest_health_snapshot_line, replay_mismatch_message, replay_seed_bundle_path,
-    replay_success_message, request_cancel_run, run_regression_suite_from_json,
-    save_run_checkpoint_json,
-    HealthSnapshot, HealthStatus, RetentionPolicy, RetentionRecord, LocalArtifactStore,
-    ArtifactStore, RunCheckpoint, CaseBundleDocument, FixtureManifest, ProvenancePolicy,
-    load_case_bundle_document_json, import_corpus_json, verify_corpus_integrity,
-};
 use crashlab_core::worker_partition::RingCoverage;
+use crashlab_core::{
+    apply_minimization, cancel_marker_path, cancel_requested, create_runner,
+    current_engine_version, default_state_dir, drive_run, drive_run_from_checkpoint,
+    drive_run_partitioned_from_checkpoint, import_corpus_json, import_seeds,
+    load_case_bundle_document_json, load_run_checkpoint_json, plan_minimization,
+    read_health_snapshot_log, read_latest_health_snapshot_line, replay_mismatch_message,
+    replay_seed_bundle_path, replay_success_message, request_cancel_run,
+    run_regression_suite_from_json, save_run_checkpoint_json, seed_content_hash,
+    verify_corpus_integrity, ArtifactStore, CampaignPreset, CancelSignal, CaseBundleDocument,
+    CaseSeed, CorpusRecord, CorpusStore, EngineVersionPolicy, FixtureManifest, HealthMonitor,
+    HealthSnapshot, HealthStatus, LocalArtifactStore, MutationBudget, PortableCorpusArchive,
+    ProvenancePolicy, QuotaGuard, RetentionPolicy, RetentionRecord, RunCheckpoint, RunId,
+    RunTerminalState, SeededPrng, TaggedSeed, ThrottleDecision, WorkerPartition,
+    RUN_CHECKPOINT_SCHEMA_VERSION,
+};
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -48,11 +51,39 @@ fn main() {
         return;
     }
 
+    // `corpus export`/`corpus import` are flag-heavy, so they are dispatched
+    // before positional arity is resolved; `corpus verify`/`corpus minimize`
+    // fall through to the arity-checked positional match below.
+    if a.as_deref() == Some("corpus") && matches!(b.as_deref(), Some("export") | Some("import")) {
+        let rest: Vec<String> = args.collect();
+        match b.as_deref() {
+            Some("export") => corpus_export_command(&rest),
+            Some("import") => corpus_import_command(&rest),
+            _ => unreachable!("dispatch is gated on export|import"),
+        }
+        return;
+    }
+
+    // `bundle export-rust` takes flags (`-o`, `--force`), so like `run start` it
+    // is dispatched before positional arity is resolved.
+    if a.as_deref() == Some("bundle") && b.as_deref() == Some("export-rust") {
+        let rest: Vec<String> = args.collect();
+        bundle_export_rust_command(&rest);
+        return;
+    }
+
     let c = args.next();
     let d = args.next();
 
     // Trailing arguments for the positional subcommands, which take none.
     let rest: Vec<String> = args.collect();
+
+    // `regression baseline <set|compare> <observed.json> <baseline.json>` needs
+    // five positionals, so it is dispatched before the four-slot match below.
+    if a.as_deref() == Some("regression") && b.as_deref() == Some("baseline") {
+        regression_baseline_command(c.as_deref(), d.as_deref(), &rest);
+        return;
+    }
 
     match (a.as_deref(), b.as_deref(), c.as_deref(), d.as_deref()) {
         (Some("run"), Some("cancel"), Some(id_str), None) => {
@@ -202,8 +233,18 @@ fn main() {
                 policy.heartbeat_ttl = Some(chrono::Duration::seconds(ttl));
             }
             policy.sweep_grace_period = chrono::Duration::seconds(grace_period_secs);
+            load_pin_manifest(&default_state_dir(), &mut policy);
 
             sweep_retention(&policy, dry_run);
+        }
+        (Some("retention"), Some("plan"), extra1, extra2) => {
+            if extra1.is_some() || extra2.is_some() || !rest.is_empty() {
+                print_usage();
+                std::process::exit(1);
+            }
+            let mut policy = RetentionPolicy::default();
+            load_pin_manifest(&default_state_dir(), &mut policy);
+            plan_retention(&policy);
         }
         (Some("fixture"), Some("verify"), Some(path), flag)
             if flag.is_none() || flag == Some("--policy") =>
@@ -222,6 +263,18 @@ fn main() {
             }
             corpus_verify_command(path);
         }
+        (Some("corpus"), Some("minimize"), Some(path), flag)
+            if flag.is_none() || flag == Some("--dry-run") || flag == Some("--apply") =>
+        {
+            corpus_minimize_command(path, flag == Some("--apply"));
+        }
+        (Some("shrink"), Some(path), Some(out_path), None) => {
+            if !rest.is_empty() {
+                print_usage();
+                std::process::exit(1);
+            }
+            shrink_command(path, out_path);
+        }
         _ => {
             print_usage();
             std::process::exit(1);
@@ -236,11 +289,19 @@ fn print_usage() {
                 crashlab runs list\n\
                 crashlab runs status <id> [--json]\n\
                 crashlab replay seed <bundle-json-path>\n\
+                crashlab bundle export-rust <bundle-json-path> -o <file.rs> [--force]\n\
                 crashlab regression-suite <suite-json-path-or-directory> [--report <report.json>]\n\
+                crashlab regression baseline set <observed-suite.json> <baseline.json>\n\
+                crashlab regression baseline compare <observed-suite.json> <baseline.json>\n\
                 crashlab corpus verify <corpus-json-path>\n\
+                crashlab corpus minimize <corpus-json-path> [--dry-run|--apply]\n\
+                crashlab shrink <bundle-json-path> <out-bundle-json-path>\n\
                 crashlab fixture verify <manifest-or-bundle-json> [--policy <require|warn|off>]\n\
                 crashlab fixture show <manifest-or-bundle-json> [--json]\n\
+                crashlab corpus export <corpus-json> --out <archive.json> [--tag <t>]... [--coverage <text>]\n\
+                crashlab corpus import <archive.json> [--into <corpus.json>] [--engine <require|skip|ignore>] [--dry-run]\n\
                 crashlab retention sweep [--dry-run] [--heartbeat-ttl <secs>] [--grace-period <secs>]\n\
+                crashlab retention plan\n\
                 \n\
                 run start options:\n\
                 \x20 --preset <smoke|nightly|deep>   campaign profile (default: $CRASHLAB_PRESET or nightly)\n\
@@ -411,6 +472,92 @@ fn fixture_show_command(path: &str, json: bool, rest: &[String]) {
     }
 }
 
+/// `crashlab bundle export-rust <bundle.json> -o <file.rs> [--force]` (#1862).
+///
+/// Writes a cargo-test source file that replays the bundle. Refuses to replace
+/// an existing file unless `--force` is given.
+fn bundle_export_rust_command(args: &[String]) {
+    let mut bundle_path: Option<&str> = None;
+    let mut out_path: Option<&str> = None;
+    let mut force = false;
+
+    let mut i = 0usize;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-o" => {
+                i += 1;
+                match args.get(i) {
+                    Some(v) => out_path = Some(v.as_str()),
+                    None => {
+                        eprintln!("missing value for -o");
+                        std::process::exit(1);
+                    }
+                }
+            }
+            "--force" => force = true,
+            other if !other.starts_with('-') && bundle_path.is_none() => {
+                bundle_path = Some(other);
+            }
+            _ => {
+                print_usage();
+                std::process::exit(1);
+            }
+        }
+        i += 1;
+    }
+
+    let (Some(bundle_path), Some(out_path)) = (bundle_path, out_path) else {
+        print_usage();
+        std::process::exit(1);
+    };
+
+    let bytes = match fs::read(bundle_path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("failed to read {bundle_path}: {e}");
+            std::process::exit(1);
+        }
+    };
+    let bundle = match crashlab_core::load_case_bundle_json(&bytes) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("failed to parse bundle {bundle_path}: {e}");
+            std::process::exit(1);
+        }
+    };
+    let source = match crashlab_core::render_rust_test(&bundle) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("failed to render reproducer: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    let written: std::io::Result<()> = if force {
+        fs::write(out_path, source.as_bytes())
+    } else {
+        use std::io::Write as _;
+        // `create_new` makes the no-overwrite check atomic with the write.
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(out_path)
+            .and_then(|mut f| f.write_all(source.as_bytes()))
+    };
+
+    match written {
+        Ok(()) => println!("wrote reproducer to {out_path}"),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            eprintln!("refusing to overwrite {out_path} (pass --force to replace it)");
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("failed to write {out_path}: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
 /// Verify corpus integrity: scan seeds and report corrupt/missing entries (#1802).
 fn corpus_verify_command(path: &str) {
     let bytes = match fs::read(path) {
@@ -450,6 +597,196 @@ fn corpus_verify_command(path: &str) {
             std::process::exit(1);
         }
     }
+}
+
+/// `crashlab corpus minimize <corpus.json> [--dry-run|--apply]` (#1853).
+///
+/// Tombstones coverage-equivalent seeds via `plan_minimization` /
+/// `apply_minimization`, writing the set of removed ids to the sidecar
+/// `<corpus.json>.tombstones.json`; the corpus archive itself is never
+/// rewritten and no seed is hard-deleted. Observed signatures and provenance
+/// are not stored in the archive yet, so every seed uses the outcome-class
+/// fallback key and has no provenance protection.
+fn corpus_minimize_command(path: &str, apply: bool) {
+    let bytes = match fs::read(path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("failed to read corpus file: {e}");
+            std::process::exit(1);
+        }
+    };
+    let seeds = match import_corpus_json(&bytes) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("failed to parse corpus: {e}");
+            std::process::exit(1);
+        }
+    };
+    let sidecar = PathBuf::from(format!("{path}.tombstones.json"));
+    let previously: Vec<u64> = match fs::read(&sidecar) {
+        Ok(raw) => match serde_json::from_slice(&raw) {
+            Ok(ids) => ids,
+            Err(e) => {
+                eprintln!("failed to parse {}: {e}", sidecar.display());
+                std::process::exit(1);
+            }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => {
+            eprintln!("failed to read {}: {e}", sidecar.display());
+            std::process::exit(1);
+        }
+    };
+
+    let mut records: Vec<CorpusRecord> = seeds
+        .into_iter()
+        .map(|seed| {
+            let mut record = CorpusRecord::new(seed);
+            record.tombstoned = previously.contains(&record.seed.id);
+            record
+        })
+        .collect();
+
+    let plan = match plan_minimization(&records) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("cannot minimize corpus: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    let live = records.iter().filter(|r| !r.tombstoned).count();
+    println!(
+        "corpus minimize: {} live seed(s), {} behavior group(s)",
+        live,
+        plan.groups.len()
+    );
+    println!(
+        "keep: {}, remove: {}, bytes saved: {}",
+        plan.keep.len(),
+        plan.remove.len(),
+        plan.bytes_saved
+    );
+    for id in &plan.remove {
+        println!("  remove seed {id}");
+    }
+
+    if !apply {
+        println!("dry run: no changes written (pass --apply to tombstone)");
+        return;
+    }
+
+    let report = apply_minimization(&plan, &mut records);
+    let mut ids = previously;
+    ids.extend(records.iter().filter(|r| r.tombstoned).map(|r| r.seed.id));
+    ids.sort_unstable();
+    ids.dedup();
+    let rendered = match serde_json::to_vec_pretty(&ids) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("failed to render tombstones: {e}");
+            std::process::exit(1);
+        }
+    };
+    if let Err(e) = fs::write(&sidecar, rendered) {
+        eprintln!("failed to write {}: {e}", sidecar.display());
+        std::process::exit(1);
+    }
+    println!(
+        "tombstoned {} seed(s) ({} bytes) in {}",
+        report.tombstoned,
+        report.bytes_tombstoned,
+        sidecar.display()
+    );
+}
+
+/// Iteration cap for `crashlab shrink`; each iteration is one replay check.
+const SHRINK_MAX_ITERATIONS: u32 = 10_000;
+
+/// `crashlab shrink <bundle> <out>` (#1849): ddmin the bundle seed payload while
+/// preserving its full signature under the replay check (`classify` plus
+/// `signatures_match`). The shrunk bundle keeps the original seed and a
+/// [`ShrinkLineage`] in its `original_seed` / `shrink_lineage` fields.
+fn shrink_command(path: &str, out_path: &str) {
+    let bytes = match fs::read(path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("failed to read {path}: {e}");
+            std::process::exit(1);
+        }
+    };
+    let doc = match load_case_bundle_document_json(&bytes) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("{path} is not a case bundle: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    let original = doc.original_or_minimal_seed().clone();
+    let expected = doc.signature.clone();
+    let seed_id = original.id;
+
+    let outcome = crashlab_core::shrink::shrink_payload(
+        &original.payload,
+        crashlab_core::shrink::ShrinkBudget::new(SHRINK_MAX_ITERATIONS),
+        |candidate: &[u8]| {
+            let probe = CaseSeed {
+                id: seed_id,
+                payload: candidate.to_vec(),
+            };
+            crashlab_core::shrink::preserve_check(
+                crashlab_core::shrink::PreserveMode::FullSignature,
+                &expected,
+                &crashlab_core::classify(&probe),
+            )
+        },
+    );
+
+    if outcome.budget_exhausted {
+        eprintln!(
+            "warning: shrink budget ({SHRINK_MAX_ITERATIONS} iterations) exhausted; result may not be minimal"
+        );
+    }
+
+    let lineage = crashlab_core::ShrinkLineage::new(
+        "ddmin-payload",
+        outcome.iterations,
+        original.payload.len(),
+        outcome.payload.len(),
+        1,
+        1,
+    )
+    .with_preserved_field("signature");
+
+    let minimal = CaseSeed {
+        id: seed_id,
+        payload: outcome.payload.clone(),
+    };
+    let mut shrunk = doc.clone();
+    shrunk.seed = minimal;
+    shrunk.provenance = None;
+    let shrunk = shrunk.with_pairing(original.clone(), lineage);
+
+    let rendered = match crashlab_core::save_case_bundle_document_json(&shrunk) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("failed to render shrunk bundle: {e}");
+            std::process::exit(1);
+        }
+    };
+    if let Err(e) = fs::write(out_path, &rendered) {
+        eprintln!("failed to write {out_path}: {e}");
+        std::process::exit(1);
+    }
+
+    println!(
+        "shrunk {} -> {} bytes in {} iterations ({})",
+        original.payload.len(),
+        outcome.payload.len(),
+        outcome.iterations,
+        out_path
+    );
 }
 
 fn list_runs() {
@@ -496,11 +833,36 @@ fn report_run_status(id: u64, as_json: bool) {
         // campaign wrote. The line is printed verbatim rather than
         // re-serialized: float parse/print is not string-stable, so a
         // re-serialized snapshot can differ from the stored bytes.
-        match read_latest_health_snapshot_line(run_id, &base) {
-            Ok(Some(line)) => println!("{line}"),
-            // A run without snapshots has not started, or ran before
-            // snapshots existed. That is a normal state, not a failure.
-            Ok(None) => println!("null"),
+        match read_health_snapshot_log(run_id, &base) {
+            Ok(log) => {
+                let latest = log.snapshots.last();
+                if !log.degraded {
+                    match read_latest_health_snapshot_line(run_id, &base) {
+                        Ok(Some(line)) => println!("{line}"),
+                        Ok(None) => println!("null"),
+                        Err(e) => {
+                            eprintln!("failed to read health snapshot for run {id}: {e}");
+                            std::process::exit(1);
+                        }
+                    }
+                } else {
+                    let mut value = latest
+                        .and_then(|snapshot| serde_json::to_value(snapshot).ok())
+                        .unwrap_or(serde_json::Value::Null);
+                    if let Some(object) = value.as_object_mut() {
+                        object.insert("degraded".into(), serde_json::Value::Bool(true));
+                        object.insert(
+                            "truncated_tail".into(),
+                            serde_json::Value::Bool(log.truncated_tail),
+                        );
+                        object.insert("corrupt_lines".into(), serde_json::json!(log.corrupt_lines));
+                    } else {
+                        value = serde_json::json!({"snapshot": null, "degraded": true,
+                            "truncated_tail": log.truncated_tail, "corrupt_lines": log.corrupt_lines});
+                    }
+                    println!("{value}");
+                }
+            }
             Err(e) => {
                 eprintln!("failed to read health snapshot for run {id}: {e}");
                 std::process::exit(1);
@@ -509,18 +871,25 @@ fn report_run_status(id: u64, as_json: bool) {
         return;
     }
 
-    match read_latest_health_snapshot(run_id, &base) {
-        Ok(Some(snapshot)) => {
-            print_snapshot_summary(&snapshot);
-        }
-        // A run without snapshots has not started, or ran before snapshots
-        // existed. That is a normal state, not a failure.
-        Ok(None) => {
-            println!("no health snapshot for run {id}");
-        }
+    let log = match read_health_snapshot_log(run_id, &base) {
+        Ok(log) => log,
         Err(e) => {
             eprintln!("failed to read health snapshot for run {id}: {e}");
             std::process::exit(1);
+        }
+    };
+    if log.degraded {
+        eprintln!(
+            "warning: health snapshot log is degraded ({} corrupt line(s), truncated tail: {})",
+            log.corrupt_lines, log.truncated_tail
+        );
+    }
+    match log.snapshots.last() {
+        Some(snapshot) => print_snapshot_summary(snapshot),
+        // A run without snapshots has not started, or ran before snapshots
+        // existed. That is a normal state, not a failure.
+        None => {
+            println!("no health snapshot for run {id}");
         }
     }
 }
@@ -584,6 +953,105 @@ fn health_status_label(status: &HealthStatus) -> &'static str {
     }
 }
 
+fn regression_baseline_command(action: Option<&str>, observed_path: Option<&str>, rest: &[String]) {
+    use crashlab_core::baseline::{
+        classify as classify_baseline, exit_code, observe_scenarios, BASELINE_SCHEMA_VERSION,
+    };
+    use crashlab_core::{Baseline, Classification};
+
+    let (action, observed_path) = match (action, observed_path, rest.len()) {
+        (Some(action @ ("set" | "compare")), Some(observed), 1) => (action, observed),
+        _ => {
+            print_usage();
+            std::process::exit(1);
+        }
+    };
+    let baseline_path = Path::new(&rest[0]);
+
+    let scenario_bytes = match fs::read(observed_path) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            eprintln!("failed to read {observed_path}: {e}");
+            std::process::exit(1);
+        }
+    };
+    let scenarios = match crashlab_core::load_regression_suite_json(&scenario_bytes) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("failed to parse observed suite {observed_path}: {e}");
+            std::process::exit(1);
+        }
+    };
+    let observed = match observe_scenarios(&scenarios) {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+    };
+
+    if action == "set" {
+        let label = format!("baseline-v{BASELINE_SCHEMA_VERSION}");
+        let baseline = Baseline::from_observed(&observed, &label);
+        let json = match baseline.to_json() {
+            Ok(j) => j,
+            Err(e) => {
+                eprintln!("failed to serialize baseline: {e}");
+                std::process::exit(1);
+            }
+        };
+        if let Err(e) = fs::write(baseline_path, json) {
+            eprintln!("failed to write baseline {}: {e}", baseline_path.display());
+            std::process::exit(1);
+        }
+        println!(
+            "wrote baseline {} ({} entries)",
+            baseline_path.display(),
+            baseline.entries.len()
+        );
+        return;
+    }
+
+    // compare: any load or integrity failure maps to exit code 2.
+    let loaded: Option<Baseline> = match fs::read_to_string(baseline_path) {
+        Ok(text) => match Baseline::from_json(&text) {
+            Ok(b) => Some(b),
+            Err(e) => {
+                eprintln!("baseline rejected: {e}");
+                None
+            }
+        },
+        Err(e) => {
+            eprintln!("failed to read baseline {}: {e}", baseline_path.display());
+            None
+        }
+    };
+
+    let (classification, baseline_ok) = match &loaded {
+        Some(b) => (classify_baseline(b, &observed), true),
+        None => (Classification::default(), false),
+    };
+
+    if baseline_ok {
+        println!("::group::Baseline classification");
+        println!("new: {}", classification.new.len());
+        for o in &classification.new {
+            println!("  + {} {}", o.signature_hash, o.category);
+        }
+        println!("recurring: {}", classification.recurring.len());
+        for o in &classification.recurring {
+            println!("  = {} {}", o.signature_hash, o.category);
+        }
+        println!("fixed: {}", classification.fixed.len());
+        for e in &classification.fixed {
+            println!("  - {} {}", e.signature_hash, e.category);
+        }
+        println!("::endgroup::");
+    }
+
+    std::process::exit(exit_code(&classification, baseline_ok));
+}
+
 fn run_regression_suite_command(path: &str, report_path: Option<&Path>) {
     let path_obj = Path::new(path);
 
@@ -639,10 +1107,7 @@ fn run_regression_suite_command(path: &str, report_path: Option<&Path>) {
                 for case in &summary.cases {
                     if !case.passed {
                         if let Some(ref error) = case.error {
-                            eprintln!(
-                                "::error::Seed {} ({}): {}",
-                                case.seed_id, case.mode, error
-                            );
+                            eprintln!("::error::Seed {} ({}): {}", case.seed_id, case.mode, error);
                         } else if let Some(ref actual) = case.actual_failure_class {
                             eprintln!(
                                 "::error::Seed {} ({}): expected {}, got {}",
@@ -680,8 +1145,8 @@ fn load_fixtures_from_directory(dir: &Path) -> Result<Vec<u8>, String> {
 
         // Only process .json files
         if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("json") {
-            let bytes = fs::read(&path)
-                .map_err(|e| format!("failed to read {}: {}", path.display(), e))?;
+            let bytes =
+                fs::read(&path).map_err(|e| format!("failed to read {}: {}", path.display(), e))?;
 
             // Try to parse as a single scenario
             if let Ok(scenario) = serde_json::from_slice::<serde_json::Value>(&bytes) {
@@ -798,8 +1263,10 @@ fn parse_run_start_options(args: &[String]) -> Result<RunStartOptions, String> {
             "--worker" => worker = parse_u32(&take_value("--worker")?, "--worker")?,
             "--output" => output = Some(PathBuf::from(take_value("--output")?)),
             "--checkpoint-interval" => {
-                checkpoint_interval =
-                    parse_u64(&take_value("--checkpoint-interval")?, "--checkpoint-interval")?;
+                checkpoint_interval = parse_u64(
+                    &take_value("--checkpoint-interval")?,
+                    "--checkpoint-interval",
+                )?;
             }
             "--progress-interval" => {
                 progress_interval =
@@ -861,13 +1328,19 @@ fn parse_u32(raw: &str, flag: &str) -> Result<u32, String> {
 /// `ring_coverage` starts empty, which is the documented representation of "no
 /// ring partitioning has been swept yet" and is exactly how a v1 checkpoint is
 /// interpreted on load.
-fn snapshot_checkpoint(campaign_id: &str, next_seed_index: u64, total_seeds: usize) -> RunCheckpoint {
+fn snapshot_checkpoint(
+    campaign_id: &str,
+    next_seed_index: u64,
+    total_seeds: usize,
+) -> RunCheckpoint {
     RunCheckpoint {
         schema: RUN_CHECKPOINT_SCHEMA_VERSION,
         campaign_id: campaign_id.to_string(),
         next_seed_index: next_seed_index as usize,
         total_seeds,
         ring_coverage: RingCoverage::new(),
+        generation: 0,
+        crc32: 0,
     }
 }
 
@@ -940,7 +1413,10 @@ fn run_start_command(args: &[String]) {
         let bytes = match fs::read(&checkpoint_path) {
             Ok(b) => b,
             Err(e) => {
-                eprintln!("failed to read checkpoint {}: {e}", checkpoint_path.display());
+                eprintln!(
+                    "failed to read checkpoint {}: {e}",
+                    checkpoint_path.display()
+                );
                 std::process::exit(1);
             }
         };
@@ -995,7 +1471,10 @@ fn run_start_command(args: &[String]) {
     println!("state dir: {}", opts.output.display());
     println!("checkpoint: {}", checkpoint_path.display());
     if cancel_requested(run_id, &state_dir) {
-        println!("note: a cancel marker already exists for run {}", opts.run_id);
+        println!(
+            "note: a cancel marker already exists for run {}",
+            opts.run_id
+        );
     }
 
     // `drive_run_from_checkpoint` advances its own checkpoint, so the closure
@@ -1004,7 +1483,11 @@ fn run_start_command(args: &[String]) {
         // Only draw on the quota while budget remains, so a seed the budget
         // would skip anyway does not spend shared allowance.
         if let (Some(guard), false) = (&quota, budget.is_exhausted()) {
-            if let ThrottleDecision::Throttled { remaining, reserved } = guard.admit_seed(class) {
+            if let ThrottleDecision::Throttled {
+                remaining,
+                reserved,
+            } = guard.admit_seed(class)
+            {
                 if quota_throttled == 0 {
                     println!(
                         "throttle: {} seed quota reached (remaining={remaining} reserved_for_higher_priority={reserved}); skipping further seeds",
@@ -1150,11 +1633,105 @@ fn run_start_command(args: &[String]) {
                 opts.run_id, summary.cancelled_at_seed, summary.seeds_processed
             );
         }
+        RunTerminalState::PlateauStop { summary } => {
+            println!(
+                "run {} stopped early on plateau: seeds_processed={}",
+                opts.run_id, summary.seeds_processed
+            );
+        }
         RunTerminalState::Failed { message } => {
             eprintln!("run {} failed: {message}", opts.run_id);
             std::process::exit(1);
         }
     }
+}
+
+fn load_pin_manifest(base: &Path, policy: &mut RetentionPolicy) {
+    let pins_path = base.join("retention-pins.json");
+    let bytes = match fs::read(&pins_path) {
+        Ok(b) => b,
+        Err(_) => return,
+    };
+    let value: serde_json::Value = match serde_json::from_slice(&bytes) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!(
+                "warning: failed to parse pin manifest at {}: {}",
+                pins_path.display(),
+                e
+            );
+            return;
+        }
+    };
+    if let Some(list) = value.get("artifacts").and_then(|v| v.as_array()) {
+        for entry in list {
+            if let Some(id) = entry.as_str() {
+                policy.pins.push(crashlab_core::retention::Pin {
+                    class: crashlab_core::retention::ArtifactClass::Raw,
+                    id: id.to_string(),
+                    reason: "pin manifest".to_string(),
+                });
+            }
+        }
+    }
+}
+
+fn plan_retention(policy: &RetentionPolicy) {
+    let base = default_state_dir();
+    let now = chrono::Utc::now();
+
+    let store_path = base.join("artifacts");
+    let store = match LocalArtifactStore::new(&store_path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!(
+                "failed to open artifact store at {}: {}",
+                store_path.display(),
+                e
+            );
+            std::process::exit(1);
+        }
+    };
+    let artifacts = match store.list_artifacts() {
+        Ok(list) => list,
+        Err(e) => {
+            eprintln!("failed to list artifacts: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    let mut records = Vec::new();
+    let mut ids = Vec::new();
+    for art in &artifacts {
+        let path = store_path.join(format!("{}.json", art.id));
+        let Ok(bytes) = fs::read(&path) else { continue };
+        let Ok(doc) = serde_json::from_slice::<CaseBundleDocument>(&bytes) else {
+            continue;
+        };
+        let created_at = chrono::DateTime::parse_from_rfc3339(&art.created_at)
+            .map(|dt| dt.with_timezone(&chrono::Utc))
+            .unwrap_or_else(|_| chrono::Utc::now());
+        records.push(RetentionRecord::new(doc, created_at));
+        ids.push(art.id.clone());
+    }
+
+    let keep = policy.retain_failure_bundle_records(&records, now);
+    let mut pruned = 0usize;
+    for (i, id) in ids.iter().enumerate() {
+        if policy.pins.iter().any(|p| &p.id == id) {
+            println!("retention plan: keep pinned failure bundle: {id}");
+        } else if keep[i] {
+            println!("retention plan: keep failure bundle: {id}");
+        } else {
+            println!("retention plan: prune failure bundle: {id}");
+            pruned += 1;
+        }
+    }
+    println!(
+        "retention plan: {} bundle(s), {} would be pruned",
+        ids.len(),
+        pruned
+    );
 }
 
 fn sweep_retention(policy: &RetentionPolicy, dry_run: bool) {
@@ -1166,7 +1743,11 @@ fn sweep_retention(policy: &RetentionPolicy, dry_run: bool) {
     let store = match LocalArtifactStore::new(&store_path) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("failed to open artifact store at {}: {}", store_path.display(), e);
+            eprintln!(
+                "failed to open artifact store at {}: {}",
+                store_path.display(),
+                e
+            );
             std::process::exit(1);
         }
     };
@@ -1181,20 +1762,45 @@ fn sweep_retention(policy: &RetentionPolicy, dry_run: bool) {
 
     let mut bundle_records = Vec::new();
     let mut artifact_ids = Vec::new();
+    let mut deleted_bundles = 0;
 
     for art in &artifacts {
         let path = store_path.join(format!("{}.json", art.id));
         let bytes = match fs::read(&path) {
             Ok(b) => b,
             Err(e) => {
-                eprintln!("warning: failed to read artifact file {}: {}", path.display(), e);
+                eprintln!(
+                    "warning: failed to read artifact file {}: {}",
+                    path.display(),
+                    e
+                );
                 continue;
             }
         };
         let doc: CaseBundleDocument = match serde_json::from_slice(&bytes) {
             Ok(d) => d,
             Err(e) => {
-                eprintln!("warning: failed to parse artifact JSON {}: {}", path.display(), e);
+                eprintln!(
+                    "warning: failed to parse artifact JSON {}: {}",
+                    path.display(),
+                    e
+                );
+                if dry_run {
+                    println!(
+                        "[retention] (dry-run) would prune corrupt artifact: {}",
+                        art.id
+                    );
+                } else {
+                    match store.delete_artifact(&art.id) {
+                        Ok(()) => {
+                            println!("pruned corrupt artifact: {}", art.id);
+                            deleted_bundles += 1;
+                        }
+                        Err(e) => {
+                            eprintln!("failed to delete corrupt artifact {}: {}", art.id, e);
+                        }
+                    }
+                }
                 continue;
             }
         };
@@ -1208,10 +1814,12 @@ fn sweep_retention(policy: &RetentionPolicy, dry_run: bool) {
     }
 
     let bundles_keep = policy.retain_failure_bundle_records(&bundle_records, now);
-    let mut deleted_bundles = 0;
     for (i, &keep) in bundles_keep.iter().enumerate() {
         if !keep {
             let id = &artifact_ids[i];
+            if policy.pins.iter().any(|p| &p.id == id) {
+                continue;
+            }
             if dry_run {
                 println!("[retention] (dry-run) would prune failure bundle: {id}");
                 continue;
@@ -1242,27 +1850,44 @@ fn sweep_retention(policy: &RetentionPolicy, dry_run: bool) {
                     let bytes = match fs::read(&checkpoint_path) {
                         Ok(b) => b,
                         Err(e) => {
-                            eprintln!("warning: failed to read checkpoint at {}: {}", checkpoint_path.display(), e);
+                            eprintln!(
+                                "warning: failed to read checkpoint at {}: {}",
+                                checkpoint_path.display(),
+                                e
+                            );
                             continue;
                         }
                     };
                     let cp: RunCheckpoint = match serde_json::from_slice(&bytes) {
                         Ok(c) => c,
                         Err(e) => {
-                            eprintln!("warning: failed to parse checkpoint at {}: {}", checkpoint_path.display(), e);
+                            eprintln!(
+                                "warning: failed to parse checkpoint at {}: {}",
+                                checkpoint_path.display(),
+                                e
+                            );
                             continue;
                         }
                     };
                     let metadata = match fs::metadata(&checkpoint_path) {
                         Ok(m) => m,
                         Err(e) => {
-                            eprintln!("warning: failed to read metadata for checkpoint at {}: {}", checkpoint_path.display(), e);
+                            eprintln!(
+                                "warning: failed to read metadata for checkpoint at {}: {}",
+                                checkpoint_path.display(),
+                                e
+                            );
                             continue;
                         }
                     };
-                    let modified = metadata.modified().unwrap_or_else(|_| std::time::SystemTime::now());
-                    let duration = modified.duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
-                    let created_at = chrono::DateTime::<chrono::Utc>::from(std::time::UNIX_EPOCH + duration);
+                    let modified = metadata
+                        .modified()
+                        .unwrap_or_else(|_| std::time::SystemTime::now());
+                    let duration = modified
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default();
+                    let created_at =
+                        chrono::DateTime::<chrono::Utc>::from(std::time::UNIX_EPOCH + duration);
 
                     checkpoint_records.push(RetentionRecord::new(cp, created_at));
                     run_dirs.push(path);
@@ -1279,7 +1904,9 @@ fn sweep_retention(policy: &RetentionPolicy, dry_run: bool) {
             let checkpoint_created_at = checkpoint_records[i].created_at;
 
             // Live Heartbeat check: refuse deletion if heartbeat is fresh within TTL
-            let heartbeat_ttl = policy.heartbeat_ttl.unwrap_or_else(|| chrono::Duration::seconds(60));
+            let heartbeat_ttl = policy
+                .heartbeat_ttl
+                .unwrap_or_else(|| chrono::Duration::seconds(60));
             let heartbeat = crashlab_core::stale_detector::read_heartbeat(dir);
             let has_live_heartbeat =
                 crashlab_core::stale_detector::is_heartbeat_alive(dir, heartbeat_ttl, now);
@@ -1319,7 +1946,11 @@ fn sweep_retention(policy: &RetentionPolicy, dry_run: bool) {
                     continue;
                 }
                 Err(e) => {
-                    eprintln!("warning: failed to acquire advisory lock for {}: {}", dir.display(), e);
+                    eprintln!(
+                        "warning: failed to acquire advisory lock for {}: {}",
+                        dir.display(),
+                        e
+                    );
                     continue;
                 }
             };
@@ -1335,7 +1966,11 @@ fn sweep_retention(policy: &RetentionPolicy, dry_run: bool) {
                         heartbeat_desc
                     );
                     if let Err(e) = fs::write(&mark_path, mark_content) {
-                        eprintln!("warning: failed to write sweep mark file at {}: {}", mark_path.display(), e);
+                        eprintln!(
+                            "warning: failed to write sweep mark file at {}: {}",
+                            mark_path.display(),
+                            e
+                        );
                     } else {
                         println!(
                             "[retention] marked candidate run directory for deletion: {} (grace period: {}s)",
@@ -1346,8 +1981,11 @@ fn sweep_retention(policy: &RetentionPolicy, dry_run: bool) {
                     continue;
                 } else if let Ok(meta) = fs::metadata(&mark_path) {
                     if let Ok(mtime) = meta.modified() {
-                        let dur = mtime.duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
-                        let marked_at = chrono::DateTime::<chrono::Utc>::from(std::time::UNIX_EPOCH + dur);
+                        let dur = mtime
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default();
+                        let marked_at =
+                            chrono::DateTime::<chrono::Utc>::from(std::time::UNIX_EPOCH + dur);
                         let elapsed = now.signed_duration_since(marked_at);
                         if elapsed < policy.sweep_grace_period {
                             println!(
@@ -1363,7 +2001,10 @@ fn sweep_retention(policy: &RetentionPolicy, dry_run: bool) {
             }
 
             if dry_run {
-                println!("[retention] (dry-run) would prune run directory: {}", dir.display());
+                println!(
+                    "[retention] (dry-run) would prune run directory: {}",
+                    dir.display()
+                );
                 continue;
             }
 
@@ -1379,5 +2020,199 @@ fn sweep_retention(policy: &RetentionPolicy, dry_run: bool) {
         }
     }
 
-    println!("sweep summary: pruned {deleted_bundles} bundle(s), {deleted_checkpoints} checkpoint(s).");
+    if dry_run {
+        println!("dry run: no changes were made");
+    }
+    println!(
+        "sweep summary: pruned {deleted_bundles} bundle(s), {deleted_checkpoints} checkpoint(s)."
+    );
+}
+
+/// Prints `msg` to stderr and exits with status 1.
+fn die(msg: &str) -> ! {
+    eprintln!("{msg}");
+    std::process::exit(1);
+}
+
+/// Loads a local corpus store from a JSON file.
+///
+/// Accepts either a serialized [`CorpusStore`] (seeds + provenance map), a
+/// legacy `CorpusArchive` document, or a raw `Vec<CaseSeed>` array.
+fn load_corpus_store(path: &str) -> CorpusStore {
+    let text = match fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) => die(&format!("failed to read {path}: {e}")),
+    };
+    if let Ok(store) = serde_json::from_str::<CorpusStore>(&text) {
+        return store;
+    }
+    match import_seeds(text.as_bytes()) {
+        Ok(seeds) => CorpusStore::from_seeds(seeds),
+        Err(e) => die(&format!("failed to parse corpus {path}: {e}")),
+    }
+}
+
+/// `crashlab corpus export <corpus-json> --out <archive.json> [--tag <t>]... [--coverage <text>]`
+///
+/// Builds a portable, content-addressed archive from a local corpus so it can be
+/// shared across campaigns. Prints the archive id on success.
+fn corpus_export_command(args: &[String]) {
+    let mut input: Option<String> = None;
+    let mut out: Option<String> = None;
+    let mut tags: Vec<String> = Vec::new();
+    let mut coverage: Option<String> = None;
+
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--out" => match iter.next() {
+                Some(v) => out = Some(v.clone()),
+                None => die("missing value for --out"),
+            },
+            "--tag" => match iter.next() {
+                Some(v) => tags.push(v.clone()),
+                None => die("missing value for --tag"),
+            },
+            "--coverage" => match iter.next() {
+                Some(v) => coverage = Some(v.clone()),
+                None => die("missing value for --coverage"),
+            },
+            other if other.starts_with("--") => {
+                die(&format!("unknown option for corpus export: {other}"))
+            }
+            other => {
+                if input.is_some() {
+                    die("corpus export expects a single <corpus-json> path");
+                }
+                input = Some(other.to_string());
+            }
+        }
+    }
+
+    let input = match input {
+        Some(p) => p,
+        None => die("missing <corpus-json> path"),
+    };
+
+    let store = load_corpus_store(&input);
+    let tagged: Vec<TaggedSeed> = store
+        .sorted_seeds()
+        .into_iter()
+        .map(|seed| {
+            let seed_tags = store.tags_for(&seed_content_hash(&seed)).to_vec();
+            TaggedSeed {
+                seed,
+                tags: seed_tags,
+            }
+        })
+        .collect();
+
+    let archive = PortableCorpusArchive::build_tagged(tagged, tags, coverage);
+    let bytes = match archive.to_json() {
+        Ok(b) => b,
+        Err(e) => die(&format!("failed to serialize archive: {e}")),
+    };
+
+    match out {
+        Some(path) => {
+            if let Err(e) = fs::write(&path, &bytes) {
+                die(&format!("failed to write archive to {path}: {e}"));
+            }
+            println!(
+                "exported {} seed(s) to {path} (archive id {})",
+                archive.manifest.seed_count,
+                archive.archive_id()
+            );
+        }
+        None => {
+            println!("{}", String::from_utf8_lossy(&bytes));
+            eprintln!(
+                "exported {} seed(s) (archive id {})",
+                archive.manifest.seed_count,
+                archive.archive_id()
+            );
+        }
+    }
+}
+
+/// `crashlab corpus import <archive.json> [--into <corpus.json>] [--engine <p>] [--dry-run]`
+///
+/// Verifies the archive (content + manifest hashes, schema), checks engine
+/// compatibility under `--engine`, and merges into the local corpus with dedup
+/// by content hash. `--into` is updated in place unless `--dry-run` is set;
+/// without `--into` the merged report is printed only.
+fn corpus_import_command(args: &[String]) {
+    let mut archive_path: Option<String> = None;
+    let mut into: Option<String> = None;
+    let mut policy = EngineVersionPolicy::AllowCompatible;
+    let mut dry_run = false;
+
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--into" => match iter.next() {
+                Some(v) => into = Some(v.clone()),
+                None => die("missing value for --into"),
+            },
+            "--engine" => match iter.next() {
+                Some(v) => match EngineVersionPolicy::parse(v) {
+                    Some(p) => policy = p,
+                    None => die("invalid --engine policy (expected require|skip|ignore)"),
+                },
+                None => die("missing value for --engine"),
+            },
+            "--dry-run" => dry_run = true,
+            other if other.starts_with("--") => {
+                die(&format!("unknown option for corpus import: {other}"))
+            }
+            other => {
+                if archive_path.is_some() {
+                    die("corpus import expects a single <archive> path");
+                }
+                archive_path = Some(other.to_string());
+            }
+        }
+    }
+
+    let archive_path = match archive_path {
+        Some(p) => p,
+        None => die("missing <archive> path"),
+    };
+
+    let bytes = match fs::read(&archive_path) {
+        Ok(b) => b,
+        Err(e) => die(&format!("failed to read archive {archive_path}: {e}")),
+    };
+    let archive = match PortableCorpusArchive::from_json(&bytes) {
+        Ok(a) => a,
+        Err(e) => die(&format!("archive verification failed: {e}")),
+    };
+
+    let mut store = match &into {
+        Some(path) if Path::new(path).exists() => load_corpus_store(path),
+        _ => CorpusStore::new(),
+    };
+
+    let report = match store.merge_archive(&archive, policy, &current_engine_version(), dry_run) {
+        Ok(r) => r,
+        Err(e) => die(&format!("merge failed: {e}")),
+    };
+
+    println!("{}", report.summary());
+
+    if !dry_run {
+        if let Some(path) = &into {
+            let json = match serde_json::to_vec_pretty(&store) {
+                Ok(j) => j,
+                Err(e) => die(&format!("failed to serialize merged corpus: {e}")),
+            };
+            if let Err(e) = fs::write(path, json) {
+                die(&format!("failed to write merged corpus to {path}: {e}"));
+            }
+            println!(
+                "wrote merged corpus ({} seed(s)) to {path}",
+                store.seeds.len()
+            );
+        }
+    }
 }

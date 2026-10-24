@@ -15,11 +15,10 @@
 //! fails a conformance assertion is a bug to be fixed (or explicitly waived by
 //! opening an issue), never a reason to weaken the suite.
 
-use crate::{CaseBundle, BundlePersistError};
-use std::path::{Path, PathBuf};
+use crate::{BundlePersistError, CaseBundle};
 use std::fs;
-use std::io;
-use std::io::Cursor;
+use std::io::{self, Cursor};
+use std::path::{Path, PathBuf};
 
 /// How long past its deadline an artifact may still be readable before the
 /// conformance suite counts the TTL as missed.
@@ -29,6 +28,9 @@ use std::io::Cursor;
 /// coarser than one second declare their own resolution to the suite; the
 /// slack covers scheduling jitter, not rounding.
 pub const TTL_EXPIRY_SLACK_SECONDS: u64 = 5;
+
+/// Maximum size of an uncompressed artifact JSON document.
+pub const MAX_ARTIFACT_JSON_BYTES: usize = crate::bundle_persist::MAX_BUNDLE_JSON_BYTES;
 
 /// Configuration for artifact storage backends.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -110,7 +112,9 @@ impl StorageError {
         match self {
             StorageError::NotFound { .. } => StorageErrorKind::NotFound,
             StorageError::InvalidId { .. } => StorageErrorKind::InvalidId,
-            StorageError::Corrupt { .. } | StorageError::Persistence(_) => StorageErrorKind::Corrupt,
+            StorageError::Corrupt { .. } | StorageError::Persistence(_) => {
+                StorageErrorKind::Corrupt
+            }
             StorageError::PermissionDenied { .. } => StorageErrorKind::PermissionDenied,
             StorageError::Io(_) => StorageErrorKind::Transient,
             StorageError::TtlUnsupported { .. } => StorageErrorKind::Unsupported,
@@ -135,16 +139,26 @@ impl std::fmt::Display for StorageError {
         match self {
             StorageError::Io(e) => write!(f, "storage I/O error: {e}"),
             StorageError::Persistence(e) => write!(f, "artifact persistence error: {e}"),
-            StorageError::NotFound { artifact_id } => write!(f, "artifact not found: {artifact_id}"),
-            StorageError::InvalidId { artifact_id } => write!(f, "invalid artifact ID: {artifact_id}"),
-            StorageError::Corrupt { artifact_id, detail } => {
+            StorageError::NotFound { artifact_id } => {
+                write!(f, "artifact not found: {artifact_id}")
+            }
+            StorageError::InvalidId { artifact_id } => {
+                write!(f, "invalid artifact ID: {artifact_id}")
+            }
+            StorageError::Corrupt {
+                artifact_id,
+                detail,
+            } => {
                 write!(f, "corrupt artifact {artifact_id}: {detail}")
             }
             StorageError::PermissionDenied { artifact_id } => {
                 write!(f, "permission denied for artifact: {artifact_id}")
             }
             StorageError::TtlUnsupported { artifact_id } => {
-                write!(f, "backend does not support TTL for artifact: {artifact_id}")
+                write!(
+                    f,
+                    "backend does not support TTL for artifact: {artifact_id}"
+                )
             }
         }
     }
@@ -258,7 +272,9 @@ pub trait ArtifactStore: Send + Sync {
         &self,
         artifact_id: &str,
     ) -> Result<Box<dyn io::Read + Send>, StorageError> {
-        Ok(Box::new(Cursor::new(self.retrieve_artifact_bytes(artifact_id)?)))
+        Ok(Box::new(Cursor::new(
+            self.retrieve_artifact_bytes(artifact_id)?,
+        )))
     }
 
     /// Returns the artifact class for retention policy purposes.
@@ -358,7 +374,10 @@ impl LocalArtifactStore {
     }
 
     /// Extracts metadata from an artifact ID and file metadata.
-    fn metadata_from_file(artifact_id: &str, path: &Path) -> Result<ArtifactMetadata, StorageError> {
+    fn metadata_from_file(
+        artifact_id: &str,
+        path: &Path,
+    ) -> Result<ArtifactMetadata, StorageError> {
         let metadata = fs::metadata(path)?;
         let modified = metadata.modified()?;
         let duration = modified
@@ -403,7 +422,12 @@ impl ArtifactStore for LocalArtifactStore {
         Self::validate_artifact_id(artifact_id)?;
 
         let path = self.artifact_path(artifact_id);
-        let json_bytes = crate::save_case_bundle_json(bundle)?;
+        let json_bytes = crate::save_sanitized_case_bundle_json(bundle)?;
+        if json_bytes.len() > MAX_ARTIFACT_JSON_BYTES {
+            return Err(StorageError::Persistence(BundlePersistError::SizeLimit {
+                limit: MAX_ARTIFACT_JSON_BYTES,
+            }));
+        }
         Self::write_atomic(&path, &json_bytes)?;
 
         Self::metadata_from_file(artifact_id, &path)
@@ -411,6 +435,11 @@ impl ArtifactStore for LocalArtifactStore {
 
     fn retrieve_artifact(&self, artifact_id: &str) -> Result<CaseBundle, StorageError> {
         let bytes = self.retrieve_artifact_bytes(artifact_id)?;
+        if bytes.len() > MAX_ARTIFACT_JSON_BYTES {
+            return Err(StorageError::Persistence(BundlePersistError::SizeLimit {
+                limit: MAX_ARTIFACT_JSON_BYTES,
+            }));
+        }
         crate::load_case_bundle_json(&bytes).map_err(|e| StorageError::Corrupt {
             artifact_id: artifact_id.to_string(),
             detail: e.to_string(),
@@ -703,8 +732,8 @@ impl ArtifactStore for MemoryArtifactStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
     use crate::{to_bundle, CaseSeed};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn unique_tmp() -> PathBuf {
         let n = SystemTime::now()
@@ -811,15 +840,17 @@ mod tests {
             payload: vec![1],
         });
 
-        let invalid_ids = vec!["", "..", "../etc/passwd", "id/with/slash", "id\\with\\backslash"];
+        let invalid_ids = vec![
+            "",
+            "..",
+            "../etc/passwd",
+            "id/with/slash",
+            "id\\with\\backslash",
+        ];
 
         for invalid_id in invalid_ids {
             let result = store.store_artifact(invalid_id, &bundle);
-            assert!(
-                result.is_err(),
-                "should reject invalid ID: {}",
-                invalid_id
-            );
+            assert!(result.is_err(), "should reject invalid ID: {}", invalid_id);
         }
 
         let _ = fs::remove_dir_all(&tmpdir);
@@ -834,7 +865,13 @@ mod tests {
             payload: vec![1],
         });
 
-        let valid_ids = vec!["run-v2..1", "artifact..name", "test..file", "..foo", "bar.."];
+        let valid_ids = vec![
+            "run-v2..1",
+            "artifact..name",
+            "test..file",
+            "..foo",
+            "bar..",
+        ];
 
         for valid_id in valid_ids {
             let result = store.store_artifact(valid_id, &bundle);

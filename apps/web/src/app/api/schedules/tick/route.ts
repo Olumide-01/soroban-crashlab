@@ -6,6 +6,7 @@ import { readSchedulingWindows } from '@/lib/capacity/windows';
 import { scheduledCampaignIdempotencyKey } from '@/lib/idempotency-key';
 import { getSchedulerState, setSchedulerState } from '../_store';
 import { getCronLock, createInMemoryCronLock } from '@/lib/cron/lock';
+import { applyMisfirePolicies, recordExecutionLedgerEntry } from '@/lib/cron/ledger';
 
 function verifyCronAuth(request: NextRequest): boolean {
   const CRON_SECRET = process.env.CRASHLAB_CRON_SECRET;
@@ -75,16 +76,50 @@ export const POST = withRouteErrorHandling(
         });
       }
 
-      // 5. Evaluate tick
-      const outcome = evaluateTick({
+      // 5. Recovery: apply misfire policies for windows missed while scheduler was down
+      const recovery = applyMisfirePolicies({
         schedules: state.schedules,
         history: state.history,
         now,
         windows: readSchedulingWindows().windows,
       });
-      setSchedulerState({ schedules: outcome.schedules, history: outcome.history });
 
-      // 6. Record tick execution for idempotency
+      // 6. Evaluate tick
+      const outcome = evaluateTick({
+        schedules: recovery.schedules,
+        history: recovery.history,
+        now,
+        windows: readSchedulingWindows().windows,
+      });
+
+      // 7. Record ledger entries for each created/deferred/skipped execution
+      const ledgerHistory = outcome.history;
+      let ledger = state.ledger;
+      for (const created of outcome.created) {
+        ledger = recordExecutionLedgerEntry(ledger, {
+          scheduleId: created.scheduleId,
+          scheduleName: created.scheduleName,
+          plannedFor: created.scheduledFor,
+          runId: created.id,
+          outcome: 'success',
+          startedAt: created.executedAt,
+          finishedAt: created.executedAt,
+        });
+      }
+      for (const deferred of outcome.deferred) {
+        const deferredAt = deferred.executedAt ?? now.toISOString();
+        ledger = recordExecutionLedgerEntry(ledger, {
+          scheduleId: deferred.scheduleId,
+          scheduleName: deferred.scheduleName ?? deferred.scheduleId,
+          plannedFor: deferred.scheduledFor ?? now.toISOString(),
+          runId: deferred.id ?? `deferred-${deferred.scheduleId}-${now.getTime()}`,
+          outcome: 'skipped_overlap',
+          startedAt: deferredAt,
+          finishedAt: deferredAt,
+        });
+      }
+
+      // 8. Record tick execution for idempotency
       const tickRecord = {
         id: `tick-${slotKeyNormalized}`,
         scheduleId: 'system',
@@ -101,19 +136,22 @@ export const POST = withRouteErrorHandling(
       };
 
       setSchedulerState({
+        ...state,
         schedules: outcome.schedules,
-        history: [...outcome.history, tickRecord],
+        history: [...ledgerHistory, tickRecord],
+        ledger,
       });
 
       return successResponse({
         created: outcome.created,
         deferred: outcome.deferred,
         schedules: outcome.schedules,
-        history: outcome.history,
+        history: [...ledgerHistory, tickRecord],
+        misfires: recovery.misfires,
         evaluatedAt: now.toISOString(),
       });
     } finally {
-      // 7. Always release lock
+      // 9. Always release lock
       await lock.release(slotKey);
     }
   },

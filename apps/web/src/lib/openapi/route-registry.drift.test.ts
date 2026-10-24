@@ -13,8 +13,10 @@ const KNOWN_ROUTES = [
   'GET /api/health',
   'GET /api/health/metrics',
   'GET /api/runs',
+  'GET /api/runs/search',
   'POST /api/runs',
   'GET /api/runs/{id}',
+  'GET /api/runs/{id}/fee-summary',
   'DELETE /api/runs/{id}',
   'GET /api/runs/{id}/annotations',
   'POST /api/runs/{id}/annotations',
@@ -30,6 +32,7 @@ const KNOWN_ROUTES = [
   'GET /api/artifacts/{id}',
   'POST /api/artifacts/validate',
   'GET /api/campaigns',
+  'GET /api/campaigns/{id}/fees',
   'POST /api/campaigns',
   'GET /api/capacity',
   'POST /api/capacity/usage',
@@ -39,6 +42,7 @@ const KNOWN_ROUTES = [
   'POST /api/webhooks/recovery',
   'POST /api/schedules/tick',
   'POST /api/uploadthing',
+  'GET /api/openapi',
 ];
 
 describe('openapi route registry drift', () => {

@@ -131,7 +131,10 @@ fn runs_status_json_emits_the_last_log_line_verbatim() {
 
     let parsed: serde_json::Value =
         serde_json::from_str(stdout.trim()).expect("--json must emit one JSON object");
-    assert_eq!(parsed["schema_version"], 1);
+    assert_eq!(
+        parsed["v"],
+        crashlab_core::health_snapshot::HEALTH_SNAPSHOT_SCHEMA_VERSION
+    );
     assert_eq!(parsed["run_id"], 42);
     assert_eq!(parsed["campaign_id"], "campaign-42");
     assert_eq!(parsed["terminal"], "completed");
@@ -219,6 +222,8 @@ fn runs_status_ignores_a_half_written_trailing_line() {
         parsed["sequence"], 3,
         "the truncated line must not be reported as a snapshot (1, 2 and the final snapshot are readable)"
     );
+    assert_eq!(parsed["degraded"], true);
+    assert_eq!(parsed["truncated_tail"], true);
 
     let _ = fs::remove_dir_all(&base);
 }

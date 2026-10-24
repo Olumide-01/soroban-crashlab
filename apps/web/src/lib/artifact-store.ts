@@ -10,6 +10,7 @@
  * and are not part of the scoped access path.
  */
 import { createHash } from "crypto";
+import { redactArtifactText, redactText } from './redaction';
 import { ScopedRepository, createMapBackend } from './tenancy/scoped-repository';
 import type { TenantScope } from './tenancy/tenant-scope';
 
@@ -27,6 +28,20 @@ export interface ArtifactCorruptionError extends Error {
   artifactId: string;
   expectedChecksum: string;
   actualChecksum: string;
+}
+
+export const MAX_STORED_ARTIFACT_BYTES = 64 * 1024 * 1024;
+
+function normalizeArtifactName(name: string): string {
+  const basename = name.split(/[\\/]/).pop() ?? '';
+  const safeName = redactText(basename.replace(/[\u0000-\u001f\u007f]/g, '')).slice(0, 255);
+  return safeName || 'artifact.bin';
+}
+
+function scrubTextArtifact(name: string, buffer: Buffer): Buffer {
+  if (!/\.(?:json|jsonl|log|txt|md)$/i.test(name)) return Buffer.from(buffer);
+  const text = new TextDecoder('utf-8', { fatal: true }).decode(buffer);
+  return Buffer.from(redactArtifactText(text), 'utf8');
 }
 
 const globalForArtifacts = globalThis as unknown as {
@@ -52,10 +67,16 @@ export function putArtifact(
   scope: TenantScope,
   artifact: { name: string; buffer: Buffer; createdAt?: string },
 ): StoredArtifact {
+  if (artifact.buffer.byteLength > MAX_STORED_ARTIFACT_BYTES) {
+    throw new RangeError(`Artifact exceeds the ${MAX_STORED_ARTIFACT_BYTES}-byte storage limit`);
+  }
+  const name = normalizeArtifactName(artifact.name);
+  const buffer = scrubTextArtifact(name, artifact.buffer);
   return artifacts.create(scope, {
-    name: artifact.name,
-    buffer: artifact.buffer,
-    sizeBytes: artifact.buffer.byteLength,
+    name,
+    buffer,
+    sizeBytes: buffer.byteLength,
+    checksum: computeChecksum(buffer),
     createdAt: artifact.createdAt ?? new Date().toISOString(),
     checksum: computeChecksum(artifact.buffer),
   });
@@ -112,14 +133,14 @@ export function getArtifactWithVerification(id: string): StoredArtifact {
   const artifact = artifactStore.get(id);
 
   if (!artifact) {
-    throw new Error(`Artifact ${id} not found`);
+    throw new Error(`Artifact ${redactText(id)} not found`);
   }
 
   const actualChecksum = computeChecksum(artifact.buffer);
 
   if (actualChecksum !== artifact.checksum) {
     const error = new Error(
-      `Artifact ${id} corruption detected: checksum mismatch`,
+      `Artifact ${redactText(id)} corruption detected: checksum mismatch`,
     ) as ArtifactCorruptionError;
     error.code = "ARTIFACT_CORRUPT";
     error.artifactId = id;
@@ -128,7 +149,7 @@ export function getArtifactWithVerification(id: string): StoredArtifact {
 
     // Quarantine corrupted artifact
     console.error(
-      `[artifact-store] Corruption detected for ${id}, quarantining`,
+      `[artifact-store] Corruption detected for ${redactText(id)}, quarantining`,
     );
     artifactStore.delete(id);
 
@@ -146,19 +167,24 @@ export function storeArtifact(
   name: string,
   buffer: Buffer,
 ): StoredArtifact {
-  const checksum = computeChecksum(buffer);
+  if (buffer.byteLength > MAX_STORED_ARTIFACT_BYTES) {
+    throw new RangeError(`Artifact exceeds the ${MAX_STORED_ARTIFACT_BYTES}-byte storage limit`);
+  }
+  const safeName = normalizeArtifactName(name);
+  const safeBuffer = scrubTextArtifact(safeName, buffer);
+  const checksum = computeChecksum(safeBuffer);
   const artifact: StoredArtifact = {
     id,
-    name,
+    name: safeName,
     createdAt: new Date().toISOString(),
-    sizeBytes: buffer.length,
-    buffer,
+    sizeBytes: safeBuffer.length,
+    buffer: safeBuffer,
     checksum,
   };
 
   artifactStore.set(id, artifact);
   console.log(
-    `[artifact-store] Stored ${id} with checksum ${checksum.slice(0, 8)}...`,
+    `[artifact-store] Stored artifact with checksum ${checksum.slice(0, 8)}...`,
   );
 
   return artifact;

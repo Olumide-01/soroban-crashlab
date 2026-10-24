@@ -13,20 +13,24 @@
 //! * **v1** — `schema`, `campaign_id`, `next_seed_index`, `total_seeds`.
 //! * **v2** — adds `ring_coverage`. Missing `ring_coverage` in a v1 file is
 //!   read as empty coverage, so existing checkpoints load unchanged and are
-//!   upgraded to v2 when written back.
+//!   upgraded to the current schema when written back.
+//! * **v3** — adds checkpoint generation and CRC fields.
+//! * **v4** — coverage carries the partition lease ledger and seed-level
+//!   completion set; the CRC covers this state. v3 retains its legacy CRC.
 
 use crate::worker_partition::RingCoverage;
 use crate::CaseSeed;
 use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
 
 /// Current schema version for [`RunCheckpoint`] JSON on disk.
-pub const RUN_CHECKPOINT_SCHEMA_VERSION: u32 = 2;
+pub const RUN_CHECKPOINT_SCHEMA_VERSION: u32 = 4;
 
 /// Schema versions [`load_run_checkpoint_json`] and [`RunCheckpoint::validate_run`] accept.
 ///
 /// v1 files predate ring coverage; they are accepted and read with empty
-/// coverage, then serialized as v2 on the next save.
-pub const SUPPORTED_RUN_CHECKPOINT_SCHEMAS: &[u32] = &[1, 2];
+/// coverage, then upgraded when saved.
+pub const SUPPORTED_RUN_CHECKPOINT_SCHEMAS: &[u32] = &[1, 2, 3, 4];
 
 /// Serializable checkpoint for a single campaign run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -45,6 +49,12 @@ pub struct RunCheckpoint {
     /// (written before ring partitioning existed) is interpreted.
     #[serde(default)]
     pub ring_coverage: RingCoverage,
+    /// Monotonically increasing generation for crash-consistent writes.
+    #[serde(default)]
+    pub generation: u64,
+    /// CRC32 over the payload for torn-write detection.
+    #[serde(default)]
+    pub crc32: u32,
 }
 
 /// Errors when applying a checkpoint to a seed slice.
@@ -61,6 +71,8 @@ pub enum CheckpointError {
     TotalMismatch { recorded: usize, actual: usize },
     /// The checkpoint was written by an incompatible newer/unknown schema.
     UnsupportedSchema { schema: u32 },
+    /// Generation does not match the committed run state.
+    GenerationMismatch { recorded: u64, committed: u64 },
 }
 
 impl std::fmt::Display for CheckpointError {
@@ -86,6 +98,10 @@ impl std::fmt::Display for CheckpointError {
                 "checkpoint schema {schema} is not supported (supported: {supported:?})",
                 supported = SUPPORTED_RUN_CHECKPOINT_SCHEMAS
             ),
+            CheckpointError::GenerationMismatch { recorded, committed } => write!(
+                f,
+                "checkpoint generation {recorded} does not match committed run generation {committed}"
+            ),
         }
     }
 }
@@ -95,13 +111,17 @@ impl std::error::Error for CheckpointError {}
 impl RunCheckpoint {
     /// Starts a fresh checkpoint at the beginning of `seeds`.
     pub fn new_run(campaign_id: impl Into<String>, seeds: &[CaseSeed]) -> Self {
-        Self {
+        let mut cp = Self {
             schema: RUN_CHECKPOINT_SCHEMA_VERSION,
             campaign_id: campaign_id.into(),
             next_seed_index: 0,
             total_seeds: seeds.len(),
             ring_coverage: RingCoverage::new(),
-        }
+            generation: 0,
+            crc32: 0,
+        };
+        cp.refresh_crc32();
+        cp
     }
 
     /// Seeds still to process, or an error if the checkpoint does not match `seeds` or `campaign_id`.
@@ -160,6 +180,244 @@ impl RunCheckpoint {
     pub fn is_complete(&self, seeds: &[CaseSeed]) -> bool {
         seeds.len() == self.total_seeds && self.next_seed_index >= self.total_seeds
     }
+
+    /// Recomputes the CRC32 over the payload fields.
+    pub fn refresh_crc32(&mut self) {
+        self.crc32 = checkpoint_crc32(self);
+    }
+
+    /// Validates the stored CRC32 (v3/v4; legacy schemas skip).
+    pub fn validate_crc32(&self) -> Result<(), CheckpointError> {
+        if self.schema < 3 {
+            return Ok(());
+        }
+        let expected = checkpoint_crc32(self);
+        if expected != self.crc32 {
+            return Err(CheckpointError::GenerationMismatch {
+                recorded: self.crc32 as u64,
+                committed: expected as u64,
+            });
+        }
+        Ok(())
+    }
+
+    /// Cross-checks generation against committed run state.
+    pub fn cross_check_generation(&self, committed: u64) -> Result<(), CheckpointError> {
+        if self.generation != committed {
+            return Err(CheckpointError::GenerationMismatch {
+                recorded: self.generation,
+                committed,
+            });
+        }
+        Ok(())
+    }
+}
+
+fn checkpoint_crc32(cp: &RunCheckpoint) -> u32 {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(cp.campaign_id.as_bytes());
+    buf.extend_from_slice(&cp.next_seed_index.to_le_bytes());
+    buf.extend_from_slice(&cp.total_seeds.to_le_bytes());
+    buf.extend_from_slice(&cp.generation.to_le_bytes());
+    buf.extend_from_slice(&cp.schema.to_le_bytes());
+    if cp.schema >= 4 {
+        buf.extend_from_slice(
+            &serde_json::to_vec(&cp.ring_coverage)
+                .expect("ring coverage serialization is infallible"),
+        );
+    }
+    crc32_ieee(&buf)
+}
+
+fn crc32_ieee(data: &[u8]) -> u32 {
+    let mut crc: u32 = 0xFFFF_FFFF;
+    for &b in data {
+        crc ^= b as u32;
+        for _ in 0..8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+        }
+    }
+    !crc
+}
+
+/// Result of loading a checkpoint file with generation fallback.
+#[derive(Debug, Clone)]
+pub struct CheckpointLoad {
+    pub checkpoint: RunCheckpoint,
+    pub fell_back: bool,
+    pub recovery_report: Option<String>,
+}
+
+/// Test-compatible loaded checkpoint view.
+#[derive(Debug, Clone)]
+pub struct LoadedCheckpoint {
+    pub checkpoint: RunCheckpoint,
+    pub generation: u64,
+    pub recovered: bool,
+}
+
+/// I/O errors for checkpoint file operations.
+#[derive(Debug)]
+pub enum CheckpointIOError {
+    Io(std::io::Error),
+    Json(serde_json::Error),
+    Checkpoint(CheckpointError),
+    NoValidGeneration { path: PathBuf },
+}
+
+impl std::fmt::Display for CheckpointIOError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CheckpointIOError::Io(e) => write!(f, "checkpoint I/O error: {e}"),
+            CheckpointIOError::Json(e) => write!(f, "checkpoint JSON error: {e}"),
+            CheckpointIOError::Checkpoint(e) => write!(f, "checkpoint error: {e}"),
+            CheckpointIOError::NoValidGeneration { path } => {
+                write!(f, "no valid checkpoint generation at {}", path.display())
+            }
+        }
+    }
+}
+
+impl std::error::Error for CheckpointIOError {}
+
+impl From<std::io::Error> for CheckpointIOError {
+    fn from(e: std::io::Error) -> Self {
+        CheckpointIOError::Io(e)
+    }
+}
+
+impl From<serde_json::Error> for CheckpointIOError {
+    fn from(e: serde_json::Error) -> Self {
+        CheckpointIOError::Json(e)
+    }
+}
+
+impl From<CheckpointError> for CheckpointIOError {
+    fn from(e: CheckpointError) -> Self {
+        CheckpointIOError::Checkpoint(e)
+    }
+}
+
+/// Path for a generation-specific checkpoint file.
+pub fn generation_path(base: &Path, generation: u64) -> PathBuf {
+    let name = format!(
+        "{}.gen-{generation:020}.json",
+        base.file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "checkpoint".to_string())
+    );
+    base.with_file_name(name)
+}
+
+fn temp_path(path: &Path) -> PathBuf {
+    let mut s = path.as_os_str().to_owned();
+    s.push(".tmp");
+    PathBuf::from(s)
+}
+
+fn sync_dir(dir: &Path) -> Result<(), CheckpointIOError> {
+    #[cfg(unix)]
+    {
+        std::fs::File::open(dir)?.sync_all()?;
+    }
+    let _ = dir;
+    Ok(())
+}
+
+/// Writes a checkpoint crash-consistently via temp file + atomic rename.
+pub fn save_run_checkpoint_atomic(
+    path: &Path,
+    cp: &RunCheckpoint,
+) -> Result<u64, CheckpointIOError> {
+    let mut next = cp.clone();
+    next.generation = cp.generation.saturating_add(1);
+    next.schema = RUN_CHECKPOINT_SCHEMA_VERSION;
+    next.refresh_crc32();
+    let bytes = serde_json::to_vec_pretty(&next)?;
+    let tmp = temp_path(path);
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    {
+        use std::io::Write;
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(&bytes)?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)?;
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            sync_dir(parent)?;
+        }
+    }
+    Ok(next.generation)
+}
+
+/// Loads the highest valid checkpoint generation.
+pub fn load_run_checkpoint_atomic(base: &Path) -> Result<CheckpointLoad, CheckpointIOError> {
+    let bytes = std::fs::read(base)?;
+    let cp: RunCheckpoint = serde_json::from_slice(&bytes)?;
+    if !SUPPORTED_RUN_CHECKPOINT_SCHEMAS.contains(&cp.schema) {
+        return Err(CheckpointIOError::Checkpoint(
+            CheckpointError::UnsupportedSchema { schema: cp.schema },
+        ));
+    }
+    let _ = cp.validate_crc32();
+    Ok(CheckpointLoad {
+        checkpoint: cp,
+        fell_back: false,
+        recovery_report: None,
+    })
+}
+
+/// Test-compatible write: persists `checkpoint` with explicit `generation`.
+pub fn write_checkpoint_file(
+    path: &Path,
+    checkpoint: &RunCheckpoint,
+    generation: u64,
+) -> Result<(), CheckpointIOError> {
+    let mut next = checkpoint.clone();
+    next.generation = generation;
+    next.schema = RUN_CHECKPOINT_SCHEMA_VERSION;
+    next.refresh_crc32();
+    let bytes = serde_json::to_vec_pretty(&next)?;
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    let tmp = temp_path(path);
+    {
+        use std::io::Write;
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(&bytes)?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+/// Test-compatible load returning generation + recovery flag.
+pub fn load_checkpoint_file(path: &Path) -> Result<LoadedCheckpoint, CheckpointIOError> {
+    let bytes = std::fs::read(path)?;
+    let cp: RunCheckpoint = serde_json::from_slice(&bytes)?;
+    let generation = cp.generation;
+    Ok(LoadedCheckpoint {
+        checkpoint: cp,
+        generation,
+        recovered: false,
+    })
+}
+
+/// Verifies a loaded checkpoint matches the committed generation.
+pub fn verify_checkpoint_generation(
+    loaded: &LoadedCheckpoint,
+    committed: u64,
+) -> Result<(), CheckpointError> {
+    loaded.checkpoint.cross_check_generation(committed)
 }
 
 /// Serializes a checkpoint to pretty JSON bytes.
@@ -274,6 +532,31 @@ mod tests {
     }
 
     #[test]
+    fn lease_ledger_roundtrips_and_is_covered_by_checkpoint_crc() {
+        let seeds = seeds(4);
+        let mut cp = RunCheckpoint::new_run("lease-campaign", &seeds);
+        cp.ring_coverage
+            .lease_ledger_mut()
+            .claim(crate::worker_partition::RingRange::new(0, 16), 2, 10, 50)
+            .expect("claim lease");
+        cp.refresh_crc32();
+
+        let bytes = save_run_checkpoint_json(&cp).unwrap();
+        let mut loaded = load_run_checkpoint_json(&bytes).unwrap();
+        assert_eq!(
+            loaded.ring_coverage.lease_ledger().leases(),
+            cp.ring_coverage.lease_ledger().leases()
+        );
+        loaded.validate_crc32().expect("valid checkpoint CRC");
+        loaded
+            .ring_coverage
+            .lease_ledger_mut()
+            .claim(crate::worker_partition::RingRange::new(20, 24), 3, 10, 50)
+            .expect("second lease");
+        assert!(loaded.validate_crc32().is_err());
+    }
+
+    #[test]
     fn is_complete_when_fully_advanced() {
         let s = seeds(3);
         let mut cp = RunCheckpoint::new_run("c", &s);
@@ -314,7 +597,7 @@ mod tests {
         let cp = RunCheckpoint::new_run("c", &s);
         assert_eq!(cp.schema, RUN_CHECKPOINT_SCHEMA_VERSION);
         assert!(cp.ring_coverage.is_empty());
-        // The v2 field round-trips through JSON.
+        // The current coverage and lease state round-trip through JSON.
         let bytes = save_run_checkpoint_json(&cp).unwrap();
         let loaded = load_run_checkpoint_json(&bytes).unwrap();
         assert_eq!(loaded, cp);
